@@ -12,31 +12,39 @@ fi
 
 mkdir -p "$PROJECT_ROOT/output"
 
-echo "Creating Hive raw external tables..."
+BEELINE_URL="${BEELINE_URL:-jdbc:hive2://hadoop-03.uni.innopolis.ru:10001}"
+HIVE_USER="${HIVE_USER:-$DB_USER}"
+HIVE_PASSWORD="${HIVE_PASSWORD:-$DB_PASSWORD}"
 
-hive \
-  --hiveconf HIVE_DB="$HIVE_DB" \
-  --hiveconf HDFS_BASE="$HDFS_BASE" \
-  -f "$PROJECT_ROOT/sql/hive/01_create_raw_tables.hql"
+run_beeline_file() {
+  local file_path="$1"
+
+  beeline \
+    -u "$BEELINE_URL" \
+    -n "$HIVE_USER" \
+    -p "$HIVE_PASSWORD" \
+    --hiveconf HIVE_DB="$HIVE_DB" \
+    --hiveconf HDFS_BASE="$HDFS_BASE" \
+    -f "$file_path"
+}
+
+echo "Creating Hive raw external tables..."
+run_beeline_file "$PROJECT_ROOT/sql/hive/01_create_raw_tables.hql"
 
 echo "Creating Hive Parquet tables..."
-
-hive \
-  --hiveconf HIVE_DB="$HIVE_DB" \
-  --hiveconf HDFS_BASE="$HDFS_BASE" \
-  -f "$PROJECT_ROOT/sql/hive/02_create_parquet_tables.hql"
+run_beeline_file "$PROJECT_ROOT/sql/hive/02_create_parquet_tables.hql"
 
 echo "Creating Hive enriched table..."
-
-hive \
-  --hiveconf HIVE_DB="$HIVE_DB" \
-  --hiveconf HDFS_BASE="$HDFS_BASE" \
-  -f "$PROJECT_ROOT/sql/hive/03_create_enriched_table.hql"
+run_beeline_file "$PROJECT_ROOT/sql/hive/03_create_enriched_table.hql"
 
 echo "Checking Hive table counts..."
 
-hive \
-  --hiveconf HIVE_DB="$HIVE_DB" \
+beeline \
+  -u "$BEELINE_URL" \
+  -n "$HIVE_USER" \
+  -p "$HIVE_PASSWORD" \
+  --showHeader=true \
+  --outputformat=tsv2 \
   -e "
 USE $HIVE_DB;
 
