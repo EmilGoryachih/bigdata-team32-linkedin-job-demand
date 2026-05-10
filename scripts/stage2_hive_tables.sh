@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+echo "Preparing HDFS directories for Hive tables..."
+
+hdfs dfs -mkdir -p "$HDFS_BASE/warehouse"
+hdfs dfs -mkdir -p "$HDFS_BASE/parquet"
+hdfs dfs -mkdir -p "$HDFS_BASE/enriched"
+
+hdfs dfs -rm -r -f "$HDFS_BASE/parquet/linkedin_job_postings_parquet"
+hdfs dfs -rm -r -f "$HDFS_BASE/parquet/job_skills_parquet"
+hdfs dfs -rm -r -f "$HDFS_BASE/parquet/job_summary_parquet"
+hdfs dfs -rm -r -f "$HDFS_BASE/enriched/linkedin_jobs_enriched"
+
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [ -f "$PROJECT_ROOT/.env" ]; then

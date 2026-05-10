@@ -1,4 +1,6 @@
-CREATE DATABASE IF NOT EXISTS ${hiveconf:HIVE_DB};
+CREATE DATABASE IF NOT EXISTS ${hiveconf:HIVE_DB}
+LOCATION '${hiveconf:HDFS_BASE}/warehouse';
+
 USE ${hiveconf:HIVE_DB};
 
 SET hive.exec.compress.output=true;
@@ -8,6 +10,7 @@ DROP TABLE IF EXISTS linkedin_jobs_enriched;
 
 CREATE TABLE linkedin_jobs_enriched
 STORED AS PARQUET
+LOCATION '${hiveconf:HDFS_BASE}/enriched/linkedin_jobs_enriched'
 AS
 SELECT
     p.job_link,
