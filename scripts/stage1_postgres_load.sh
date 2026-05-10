@@ -4,7 +4,9 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [ -f "$PROJECT_ROOT/.env" ]; then
+  set -a
   source "$PROJECT_ROOT/.env"
+  set +a
 else
   echo ".env file not found. Copy .env.example to .env and configure it."
   exit 1
