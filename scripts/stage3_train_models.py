@@ -30,7 +30,7 @@ from pyspark.ml.evaluation import (
     MulticlassClassificationEvaluator,
 )
 from pyspark.ml.feature import (
-    MinMaxScaler,
+    MaxAbsScaler,
     OneHotEncoder,
     StandardScaler,
     StringIndexer,
@@ -98,8 +98,11 @@ def build_feature_stages(scaler: Optional[str]) -> List:
     * ``None``      — no scaling, classifier reads ``raw_features``.
     * ``"standard"``— ``StandardScaler`` (mean=False to keep one-hot
       vectors sparse). Output column ``features``.
-    * ``"minmax"``  — ``MinMaxScaler``; output column ``features``.
-      Used for NaiveBayes which requires non-negative inputs.
+    * ``"maxabs"``  — ``MaxAbsScaler``; output column ``features``.
+      Used for NaiveBayes: dividing by ``max(|x|)`` preserves
+      non-negativity even when a test value exceeds the train range
+      (unlike ``MinMaxScaler``, which can emit negatives for
+      out-of-range test points).
     """
     stages: List = []
     encoded_cols: List[str] = []
@@ -133,9 +136,9 @@ def build_feature_stages(scaler: Optional[str]) -> List:
                 withStd=True,
             )
         )
-    elif scaler == "minmax":
+    elif scaler == "maxabs":
         stages.append(
-            MinMaxScaler(inputCol="raw_features", outputCol="features")
+            MaxAbsScaler(inputCol="raw_features", outputCol="features")
         )
     return stages
 
@@ -195,7 +198,7 @@ def make_svm() -> Tuple[Pipeline, list, LinearSVC]:
 
 def make_nb() -> Tuple[Pipeline, list, NaiveBayes]:
     """Build the multinomial Naive Bayes pipeline and tuning grid."""
-    stages = build_feature_stages(scaler="minmax")
+    stages = build_feature_stages(scaler="maxabs")
     nb = NaiveBayes(
         labelCol=LABEL_COL,
         featuresCol="features",
