@@ -12,13 +12,11 @@ written to the local ``output/`` directory so the grader can read them
 without HDFS access.
 """
 
-from __future__ import annotations
-
 import argparse
 import csv
 import math
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from pyspark.ml import Pipeline
 from pyspark.ml.classification import (
@@ -91,7 +89,7 @@ def build_spark() -> SparkSession:
     )
 
 
-def build_feature_stages(scaler: str | None) -> List:
+def build_feature_stages(scaler: Optional[str]) -> List:
     """Build the shared preprocessing stages.
 
     ``scaler`` selects the optional scaling step appended to the

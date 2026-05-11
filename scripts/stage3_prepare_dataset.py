@@ -11,11 +11,10 @@ outputs are passed as CLI flags so the pipeline is reproducible from
 ``scripts/stage3.sh``.
 """
 
-from __future__ import annotations
-
 import argparse
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Tuple
 
 from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
@@ -207,7 +206,7 @@ def add_high_demand_label(df: DataFrame) -> DataFrame:
     ).drop("cat_median")
 
 
-def temporal_split(df: DataFrame) -> tuple[DataFrame, DataFrame, date]:
+def temporal_split(df: DataFrame) -> Tuple[DataFrame, DataFrame, date]:
     """Split the dataframe so the oldest ``TRAIN_FRACTION`` of time goes to train."""
     days = df.select(F.datediff(F.col("time_bucket"), F.lit(EPOCH.isoformat())).alias("d"))
     cutoff_days = days.approxQuantile("d", [TRAIN_FRACTION], 0.001)[0]

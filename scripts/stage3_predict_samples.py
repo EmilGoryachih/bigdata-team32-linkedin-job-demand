@@ -11,8 +11,6 @@ then writes a single combined CSV of predictions to ``output/``. The
 file is intentionally small so the grader can read it without HDFS.
 """
 
-from __future__ import annotations
-
 import argparse
 from datetime import date, timedelta
 from pathlib import Path
