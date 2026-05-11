@@ -30,7 +30,6 @@ from pyspark.ml.evaluation import (
     MulticlassClassificationEvaluator,
 )
 from pyspark.ml.feature import (
-    MaxAbsScaler,
     OneHotEncoder,
     StandardScaler,
     StringIndexer,
@@ -96,13 +95,11 @@ def build_feature_stages(scaler: Optional[str]) -> List:
     assembled feature vector:
 
     * ``None``      — no scaling, classifier reads ``raw_features``.
+      Used by RF, GBT, and Gaussian NB (none of them care about
+      feature magnitudes).
     * ``"standard"``— ``StandardScaler`` (mean=False to keep one-hot
-      vectors sparse). Output column ``features``.
-    * ``"maxabs"``  — ``MaxAbsScaler``; output column ``features``.
-      Used for NaiveBayes: dividing by ``max(|x|)`` preserves
-      non-negativity even when a test value exceeds the train range
-      (unlike ``MinMaxScaler``, which can emit negatives for
-      out-of-range test points).
+      vectors sparse and non-negative). Output column ``features``.
+      Used by LinearSVC.
     """
     stages: List = []
     encoded_cols: List[str] = []
@@ -135,10 +132,6 @@ def build_feature_stages(scaler: Optional[str]) -> List:
                 withMean=False,
                 withStd=True,
             )
-        )
-    elif scaler == "maxabs":
-        stages.append(
-            MaxAbsScaler(inputCol="raw_features", outputCol="features")
         )
     return stages
 
@@ -197,12 +190,24 @@ def make_svm() -> Tuple[Pipeline, list, LinearSVC]:
 
 
 def make_nb() -> Tuple[Pipeline, list, NaiveBayes]:
-    """Build the multinomial Naive Bayes pipeline and tuning grid."""
-    stages = build_feature_stages(scaler="maxabs")
+    """Build the Gaussian Naive Bayes pipeline and tuning grid.
+
+    Gaussian NB models each feature as a per-class Normal distribution
+    and is the right NB variant for our mixed continuous + one-hot
+    feature space. Multinomial NB (the previous choice) treats feature
+    values as counts from a fixed vocabulary, which makes no semantic
+    sense for ``year``, ``lag_count_*``, etc. — it produced inverted
+    predictions (AUC ≈ 0.05) on the previous run. Gaussian NB also
+    does not require non-negative inputs, so no extra scaler is
+    needed; ``raw_features`` is fed in directly. ``smoothing`` here
+    controls variance smoothing added to each feature's per-class
+    variance to avoid division by zero on near-constant features.
+    """
+    stages = build_feature_stages(scaler=None)
     nb = NaiveBayes(
         labelCol=LABEL_COL,
-        featuresCol="features",
-        modelType="multinomial",
+        featuresCol="raw_features",
+        modelType="gaussian",
     )
     grid = (
         ParamGridBuilder()
