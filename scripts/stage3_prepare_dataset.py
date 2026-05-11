@@ -35,6 +35,16 @@ MIN_WEEKS_FOR_WEEKLY = 20
 LAG_PERIODS = (1, 4)
 ROLLING_WINDOW = 4
 
+# Drop (country, position) groups that have fewer than this many time
+# buckets of history. Sparse groups make lag/rolling features mostly
+# zero-fill noise.
+MIN_BUCKETS_PER_GROUP = 5
+
+# Per-category quantile that defines "high demand" relative to the
+# typical week for that search position. 0.75 gives a top-quartile
+# label that is sharper and more actionable than a 0.5 median split.
+HIGH_DEMAND_QUANTILE = 0.75
+
 # Fraction of the (ordered) time range to assign to the training split.
 TRAIN_FRACTION = 0.8
 
@@ -77,13 +87,12 @@ def load_clean_enriched(spark: SparkSession, path: str) -> DataFrame:
     df = spark.read.parquet(path)
     df = df.filter(
         F.col("first_seen").isNotNull()
-        & F.col("search_city").isNotNull()
         & F.col("search_country").isNotNull()
         & F.col("search_position").isNotNull()
     )
     # Normalise the string keys so the same group is not split because of
     # whitespace or casing differences.
-    for col_name in ("search_city", "search_country", "search_position"):
+    for col_name in ("search_country", "search_position"):
         df = df.withColumn(col_name, F.trim(F.lower(F.col(col_name))))
     return df
 
@@ -113,8 +122,16 @@ def add_time_bucket(df: DataFrame, mode: str) -> DataFrame:
 
 
 def aggregate_groups(df: DataFrame) -> DataFrame:
-    """Aggregate raw postings to one row per (bucket, country, city, category)."""
-    keys = ["time_bucket", "search_country", "search_city", "search_position"]
+    """Aggregate raw postings to one row per (bucket, country, category).
+
+    ``search_city`` is intentionally not part of the grouping key. At
+    city granularity the vast majority of (country, city, category)
+    cells have only one or two observations, which makes lag and
+    rolling features essentially zero. Collapsing across cities gives
+    denser per-group histories at the cost of losing city-level
+    resolution, which is the right trade-off for demand prediction.
+    """
+    keys = ["time_bucket", "search_country", "search_position"]
 
     base = df.groupBy(*keys).agg(
         F.count(F.lit(1)).alias("group_count"),
@@ -139,6 +156,19 @@ def aggregate_groups(df: DataFrame) -> DataFrame:
     )
 
 
+def filter_sparse_groups(df: DataFrame, min_buckets: int) -> DataFrame:
+    """Keep only (country, position) groups with enough time history."""
+    counts = (
+        df.groupBy("search_country", "search_position")
+        .agg(F.countDistinct("time_bucket").alias("n_buckets"))
+    )
+    keep = (
+        counts.filter(F.col("n_buckets") >= F.lit(min_buckets))
+        .select("search_country", "search_position")
+    )
+    return df.join(F.broadcast(keep), ["search_country", "search_position"], "inner")
+
+
 def add_temporal_features(df: DataFrame) -> DataFrame:
     """Derive deterministic temporal features from ``time_bucket``."""
     return (
@@ -155,13 +185,13 @@ def add_temporal_features(df: DataFrame) -> DataFrame:
 
 
 def add_lag_features(df: DataFrame) -> DataFrame:
-    """Add lag and rolling-mean features over each (country, city, category) group.
+    """Add lag and rolling-mean features over each (country, category) group.
 
     The values are computed strictly from past time buckets so they can
     be used safely at prediction time without leaking the current count.
     """
     group_window = (
-        Window.partitionBy("search_country", "search_city", "search_position")
+        Window.partitionBy("search_country", "search_position")
         .orderBy("time_bucket")
     )
     rolling_window = group_window.rowsBetween(-ROLLING_WINDOW, -1)
@@ -192,18 +222,30 @@ def add_lag_features(df: DataFrame) -> DataFrame:
 
 
 def add_high_demand_label(df: DataFrame) -> DataFrame:
-    """Derive a per-category-median ``high_demand`` binary label."""
-    medians = (
+    """Derive a per-category top-quantile ``high_demand`` binary label.
+
+    The threshold is the ``HIGH_DEMAND_QUANTILE`` quantile of
+    ``group_count`` within each ``search_position``. A row is labelled
+    ``1`` if its count exceeds the threshold for its category and ``0``
+    otherwise. This produces a roughly (1 - q):q class balance per
+    category — natural class imbalance that downstream weighting can
+    address if needed.
+    """
+    thresholds = (
         df.groupBy("search_position")
-        .agg(F.expr("percentile_approx(group_count, 0.5)").alias("cat_median"))
+        .agg(
+            F.expr(
+                "percentile_approx(group_count, {q})".format(q=HIGH_DEMAND_QUANTILE)
+            ).alias("cat_threshold")
+        )
     )
-    joined = df.join(F.broadcast(medians), "search_position")
+    joined = df.join(F.broadcast(thresholds), "search_position")
     return joined.withColumn(
         "high_demand",
-        F.when(F.col("group_count") > F.col("cat_median"), F.lit(1))
+        F.when(F.col("group_count") > F.col("cat_threshold"), F.lit(1))
         .otherwise(F.lit(0))
         .cast(IntegerType()),
-    ).drop("cat_median")
+    ).drop("cat_threshold")
 
 
 def temporal_split(df: DataFrame) -> Tuple[DataFrame, DataFrame, date]:
@@ -241,6 +283,14 @@ def main() -> None:
     bucketed = add_time_bucket(raw, mode)
 
     agg = aggregate_groups(bucketed)
+    rows_before_filter = agg.count()
+    agg = filter_sparse_groups(agg, MIN_BUCKETS_PER_GROUP)
+    rows_after_filter = agg.count()
+    print(
+        f"[stage3.prepare] Sparse-group filter (min_buckets={MIN_BUCKETS_PER_GROUP}): "
+        f"{rows_before_filter} -> {rows_after_filter} rows",
+        flush=True,
+    )
     agg = add_temporal_features(agg)
     agg = add_lag_features(agg)
     agg = add_high_demand_label(agg)
@@ -281,6 +331,10 @@ def main() -> None:
     summary_path = out_dir / "stage3_prepare_summary.txt"
     with summary_path.open("w", encoding="utf-8") as fh:
         fh.write(f"bucket_mode={mode}\n")
+        fh.write(f"high_demand_quantile={HIGH_DEMAND_QUANTILE}\n")
+        fh.write(f"min_buckets_per_group={MIN_BUCKETS_PER_GROUP}\n")
+        fh.write(f"rows_before_filter={rows_before_filter}\n")
+        fh.write(f"rows_after_filter={rows_after_filter}\n")
         fh.write(f"min_time_bucket={bounds['min_bucket']}\n")
         fh.write(f"max_time_bucket={bounds['max_bucket']}\n")
         fh.write(f"group_rows={bounds['group_rows']}\n")

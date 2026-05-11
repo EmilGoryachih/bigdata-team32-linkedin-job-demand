@@ -19,16 +19,19 @@ from typing import Iterable, List
 from pyspark.ml import PipelineModel
 from pyspark.sql import DataFrame, Row, SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.types import StructType
 
 
 DEFAULT_ML_BASE = "/user/team32/linkedin/ml"
-MODEL_NAMES = ("rf", "svm", "nb")
+MODEL_NAMES = ("rf", "gbt", "svm", "nb")
 
+# (country, search_position) — search_city was dropped from the aggregation
+# key in stage3_prepare_dataset.py.
 CRAFTED_SCENARIOS = (
-    ("united states", "new york", "software engineer"),
-    ("united kingdom", "london", "data scientist"),
-    ("germany", "berlin", "product manager"),
-    ("india", "bangalore", "software engineer"),
+    ("united states", "software engineer"),
+    ("united kingdom", "data scientist"),
+    ("germany", "product manager"),
+    ("india", "software engineer"),
 )
 
 
@@ -82,9 +85,14 @@ def build_crafted_rows(
     scenarios: Iterable[tuple],
     future_day: date,
     defaults: Row,
-) -> List[Row]:
-    """Build a list of crafted Row objects for future-period scenarios."""
-    rows: List[Row] = []
+    schema: StructType,
+) -> List[tuple]:
+    """Build crafted future-period rows as tuples in ``schema`` field order.
+
+    We avoid ``pyspark.sql.Row(**kwargs)`` because PySpark sorts kwargs
+    alphabetically, which would misalign the values when the row is
+    later interpreted under an explicit schema.
+    """
     iso_week = future_day.isocalendar()[1]
     iso_weekday = future_day.isoweekday()  # 1=Monday..7=Sunday
     # Spark's ``dayofweek`` returns 1=Sunday..7=Saturday, so adjust.
@@ -92,31 +100,37 @@ def build_crafted_rows(
     quarter = (future_day.month - 1) // 3 + 1
     is_weekend = 1 if iso_weekday in (6, 7) else 0
 
-    for country, city, position in scenarios:
-        rows.append(
-            Row(
-                time_bucket=future_day,
-                search_country=country,
-                search_city=city,
-                search_position=position,
-                group_count=0,
-                distinct_companies=0,
-                distinct_skills=0,
-                summary_coverage=0.0,
-                year=future_day.year,
-                month=future_day.month,
-                week_of_year=iso_week,
-                day_of_week=spark_dow,
-                quarter=quarter,
-                is_weekend=is_weekend,
-                lag_count_1=float(defaults["lag_count_1"] or 0),
-                lag_count_4=float(defaults["lag_count_4"] or 0),
-                rolling_mean_count_4=float(defaults["rolling_mean_count_4"] or 0),
-                lag_distinct_companies_1=float(defaults["lag_distinct_companies_1"] or 0),
-                lag_distinct_skills_1=float(defaults["lag_distinct_skills_1"] or 0),
-                high_demand=0,
-            )
-        )
+    lag_count_1 = int(defaults["lag_count_1"] or 0)
+    lag_count_4 = int(defaults["lag_count_4"] or 0)
+    rolling_mean_count_4 = float(defaults["rolling_mean_count_4"] or 0)
+    lag_distinct_companies_1 = int(defaults["lag_distinct_companies_1"] or 0)
+    lag_distinct_skills_1 = int(defaults["lag_distinct_skills_1"] or 0)
+
+    field_names = [f.name for f in schema.fields]
+    rows: List[tuple] = []
+    for country, position in scenarios:
+        values = {
+            "time_bucket": future_day,
+            "search_country": country,
+            "search_position": position,
+            "group_count": 0,
+            "distinct_companies": 0,
+            "distinct_skills": 0,
+            "summary_coverage": 0.0,
+            "year": future_day.year,
+            "month": future_day.month,
+            "week_of_year": iso_week,
+            "day_of_week": spark_dow,
+            "quarter": quarter,
+            "is_weekend": is_weekend,
+            "lag_count_1": lag_count_1,
+            "lag_count_4": lag_count_4,
+            "rolling_mean_count_4": rolling_mean_count_4,
+            "lag_distinct_companies_1": lag_distinct_companies_1,
+            "lag_distinct_skills_1": lag_distinct_skills_1,
+            "high_demand": 0,
+        }
+        rows.append(tuple(values.get(name) for name in field_names))
     return rows
 
 
@@ -138,7 +152,9 @@ def main() -> None:
 
     future_day = date.today() + timedelta(days=args.future_offset_days)
     defaults = median_lag_values(test)
-    crafted_rows = build_crafted_rows(CRAFTED_SCENARIOS, future_day, defaults)
+    crafted_rows = build_crafted_rows(
+        CRAFTED_SCENARIOS, future_day, defaults, test.schema
+    )
 
     # Build the crafted frame using the same schema as the test set so
     # ``unionByName`` works. ``source`` is added afterwards.
@@ -157,7 +173,6 @@ def main() -> None:
         "source",
         "time_bucket",
         "search_country",
-        "search_city",
         "search_position",
         F.col("high_demand").alias("true_label"),
     )

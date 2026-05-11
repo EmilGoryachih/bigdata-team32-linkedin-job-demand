@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Tuple
 
 from pyspark.ml import Pipeline
 from pyspark.ml.classification import (
+    GBTClassifier,
     LinearSVC,
     NaiveBayes,
     RandomForestClassifier,
@@ -45,7 +46,6 @@ LABEL_COL = "high_demand"
 
 CATEGORICAL_COLS: Tuple[str, ...] = (
     "search_country",
-    "search_city",
     "search_position",
 )
 
@@ -155,6 +155,29 @@ def make_rf() -> Tuple[Pipeline, list, RandomForestClassifier]:
         .build()
     )
     return Pipeline(stages=stages + [rf]), grid, rf
+
+
+def make_gbt() -> Tuple[Pipeline, list, GBTClassifier]:
+    """Build the Gradient Boosted Trees pipeline and tuning grid.
+
+    GBT typically outperforms a vanilla Random Forest on tabular data
+    with mixed numeric and one-hot categorical features. The grid is
+    intentionally small because each candidate model takes noticeably
+    longer to fit than its RF counterpart.
+    """
+    stages = build_feature_stages(scaler=None)
+    gbt = GBTClassifier(
+        labelCol=LABEL_COL,
+        featuresCol="raw_features",
+        seed=RANDOM_SEED,
+    )
+    grid = (
+        ParamGridBuilder()
+        .addGrid(gbt.maxIter, [20, 50])
+        .addGrid(gbt.maxDepth, [5, 8])
+        .build()
+    )
+    return Pipeline(stages=stages + [gbt]), grid, gbt
 
 
 def make_svm() -> Tuple[Pipeline, list, LinearSVC]:
@@ -313,7 +336,12 @@ def main() -> None:
     with metrics_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(["model", "accuracy", "f1", "auc"])
-        for name, builder in (("rf", make_rf), ("svm", make_svm), ("nb", make_nb)):
+        for name, builder in (
+            ("rf", make_rf),
+            ("gbt", make_gbt),
+            ("svm", make_svm),
+            ("nb", make_nb),
+        ):
             pipeline, grid, classifier = builder()
             train_one(
                 name=name,
