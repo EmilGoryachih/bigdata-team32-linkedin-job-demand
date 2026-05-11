@@ -12,6 +12,7 @@ outputs are passed as CLI flags so the pipeline is reproducible from
 """
 
 import argparse
+import sys
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Tuple
@@ -156,17 +157,43 @@ def aggregate_groups(df: DataFrame) -> DataFrame:
     )
 
 
-def filter_sparse_groups(df: DataFrame, min_buckets: int) -> DataFrame:
-    """Keep only (country, position) groups with enough time history."""
-    counts = (
+def bucket_counts_per_group(df: DataFrame) -> DataFrame:
+    """Return the number of distinct time buckets per (country, position)."""
+    return (
         df.groupBy("search_country", "search_position")
         .agg(F.countDistinct("time_bucket").alias("n_buckets"))
     )
+
+
+def filter_sparse_groups(df: DataFrame, min_buckets: int) -> DataFrame:
+    """Keep only (country, position) groups with enough time history."""
     keep = (
-        counts.filter(F.col("n_buckets") >= F.lit(min_buckets))
+        bucket_counts_per_group(df)
+        .filter(F.col("n_buckets") >= F.lit(min_buckets))
         .select("search_country", "search_position")
     )
     return df.join(F.broadcast(keep), ["search_country", "search_position"], "inner")
+
+
+def adaptive_sparse_filter(
+    df: DataFrame, target_min_buckets: int
+) -> Tuple[DataFrame, int, int]:
+    """Apply ``filter_sparse_groups`` and fall back to lower thresholds.
+
+    Some data dumps cover a very narrow time range. If the requested
+    ``target_min_buckets`` would wipe the dataset, walk the threshold
+    down to 1 (no-op) so we still produce something to train on. The
+    resulting dataset will have weak lag signal, but the script logs
+    the actual threshold used so the operator can see what happened.
+    """
+    used = target_min_buckets
+    while used > 0:
+        filtered = filter_sparse_groups(df, used)
+        kept = filtered.count()
+        if kept > 0:
+            return filtered, used, kept
+        used -= 1
+    return df.limit(0), 0, 0
 
 
 def add_temporal_features(df: DataFrame) -> DataFrame:
@@ -277,6 +304,21 @@ def main() -> None:
     print(f"[stage3.prepare] Reading enriched parquet: {args.enriched_path}", flush=True)
     raw = load_clean_enriched(spark, args.enriched_path)
 
+    # Diagnostic: what does first_seen actually look like? If the source
+    # dump only covers a few days we want to see that explicitly before
+    # any aggregation/filter strips information.
+    fs_stats = raw.agg(
+        F.min("first_seen").alias("min_fs"),
+        F.max("first_seen").alias("max_fs"),
+        F.countDistinct("first_seen").alias("distinct_fs"),
+    ).first()
+    print(
+        "[stage3.prepare] Raw first_seen: "
+        f"{fs_stats['min_fs']} -> {fs_stats['max_fs']} "
+        f"({fs_stats['distinct_fs']} distinct days)",
+        flush=True,
+    )
+
     mode = decide_bucket_mode(raw)
     print(f"[stage3.prepare] Time bucket mode: {mode}", flush=True)
 
@@ -284,13 +326,49 @@ def main() -> None:
 
     agg = aggregate_groups(bucketed)
     rows_before_filter = agg.count()
-    agg = filter_sparse_groups(agg, MIN_BUCKETS_PER_GROUP)
-    rows_after_filter = agg.count()
+
+    # Diagnostic: distribution of bucket-counts per (country, position)
+    # group. This makes it obvious why a particular min_buckets threshold
+    # does or does not survive.
+    n_groups = bucket_counts_per_group(agg).count()
+    bucket_stats = bucket_counts_per_group(agg).agg(
+        F.min("n_buckets").alias("min"),
+        F.expr("percentile_approx(n_buckets, 0.5)").alias("p50"),
+        F.expr("percentile_approx(n_buckets, 0.75)").alias("p75"),
+        F.max("n_buckets").alias("max"),
+    ).first()
     print(
-        f"[stage3.prepare] Sparse-group filter (min_buckets={MIN_BUCKETS_PER_GROUP}): "
+        f"[stage3.prepare] (country, position) groups: {n_groups}; "
+        f"buckets-per-group min={bucket_stats['min']}, p50={bucket_stats['p50']}, "
+        f"p75={bucket_stats['p75']}, max={bucket_stats['max']}",
+        flush=True,
+    )
+
+    agg, used_min_buckets, rows_after_filter = adaptive_sparse_filter(
+        agg, MIN_BUCKETS_PER_GROUP
+    )
+    if used_min_buckets != MIN_BUCKETS_PER_GROUP:
+        print(
+            f"[stage3.prepare] WARN: relaxed min_buckets from "
+            f"{MIN_BUCKETS_PER_GROUP} to {used_min_buckets} so the dataset "
+            "is non-empty (lag features will be weaker than intended)",
+            flush=True,
+        )
+    print(
+        f"[stage3.prepare] Sparse-group filter (min_buckets={used_min_buckets}): "
         f"{rows_before_filter} -> {rows_after_filter} rows",
         flush=True,
     )
+    if rows_after_filter == 0:
+        print(
+            "[stage3.prepare] FATAL: no rows survived even with min_buckets=1. "
+            "Inspect the first_seen distribution above; the temporal pipeline "
+            "cannot proceed.",
+            flush=True,
+        )
+        spark.stop()
+        sys.exit(1)
+
     agg = add_temporal_features(agg)
     agg = add_lag_features(agg)
     agg = add_high_demand_label(agg)
@@ -332,7 +410,16 @@ def main() -> None:
     with summary_path.open("w", encoding="utf-8") as fh:
         fh.write(f"bucket_mode={mode}\n")
         fh.write(f"high_demand_quantile={HIGH_DEMAND_QUANTILE}\n")
-        fh.write(f"min_buckets_per_group={MIN_BUCKETS_PER_GROUP}\n")
+        fh.write(f"min_buckets_per_group_target={MIN_BUCKETS_PER_GROUP}\n")
+        fh.write(f"min_buckets_per_group_used={used_min_buckets}\n")
+        fh.write(f"raw_min_first_seen={fs_stats['min_fs']}\n")
+        fh.write(f"raw_max_first_seen={fs_stats['max_fs']}\n")
+        fh.write(f"raw_distinct_first_seen={fs_stats['distinct_fs']}\n")
+        fh.write(f"groups_country_position={n_groups}\n")
+        fh.write(f"buckets_per_group_min={bucket_stats['min']}\n")
+        fh.write(f"buckets_per_group_p50={bucket_stats['p50']}\n")
+        fh.write(f"buckets_per_group_p75={bucket_stats['p75']}\n")
+        fh.write(f"buckets_per_group_max={bucket_stats['max']}\n")
         fh.write(f"rows_before_filter={rows_before_filter}\n")
         fh.write(f"rows_after_filter={rows_after_filter}\n")
         fh.write(f"min_time_bucket={bounds['min_bucket']}\n")
