@@ -3,7 +3,7 @@ LOCATION '${hiveconf:HDFS_BASE}/warehouse';
 
 USE ${hiveconf:HIVE_DB};
 
-SET hive.execution.engine=tez;
+SET hive.execution.engine=mr;
 SET tez.counters.max=10000;
 SET hive.exec.parallel=false;
 SET hive.stats.autogather=false;
