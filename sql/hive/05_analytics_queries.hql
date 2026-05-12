@@ -3,28 +3,24 @@ LOCATION '${hiveconf:HDFS_BASE}/warehouse';
 
 USE ${hiveconf:HIVE_DB};
 
-SET hive.execution.engine=mr;
-SET tez.counters.max=10000;
-SET hive.exec.parallel=false;
-SET hive.stats.autogather=false;
-SET hive.compute.query.using.stats=false;
-SET hive.vectorized.execution.enabled=false;
-SET hive.vectorized.execution.reduce.enabled=false;
+SET hive.execution.engine=tez;
 SET hive.exec.compress.output=true;
+SET parquet.compression=SNAPPY;
+
+-- Keep Tez, but reduce job/counter complexity for the IU cluster.
 SET hive.exec.parallel=false;
+SET hive.stats.autogather=false;
+SET hive.compute.query.using.stats=false;
 SET hive.vectorized.execution.enabled=false;
 SET hive.vectorized.execution.reduce.enabled=false;
-SET hive.compute.query.using.stats=false;
-SET hive.stats.autogather=false;
-SET tez.task.generate.counters=false;
-SET parquet.compression=SNAPPY;
-SET hive.vectorized.execution.enabled=true;
-SET hive.vectorized.execution.reduce.enabled=true;
+SET hive.input.format=org.apache.hadoop.hive.ql.io.CombineHiveInputFormat;
+SET tez.grouping.min-size=536870912;
+SET tez.grouping.max-size=1073741824;
+SET mapreduce.input.fileinputformat.split.minsize=536870912;
+SET mapreduce.input.fileinputformat.split.maxsize=1073741824;
 
 DROP TABLE IF EXISTS analytics_data_characteristics;
 DROP TABLE IF EXISTS analytics_null_coverage;
-DROP TABLE IF EXISTS analytics_clean_jobs;
-DROP TABLE IF EXISTS analytics_job_skills_exploded;
 DROP TABLE IF EXISTS analytics_top_positions_global;
 DROP TABLE IF EXISTS analytics_top_positions_by_country;
 DROP TABLE IF EXISTS analytics_top_skills_global;
@@ -36,10 +32,16 @@ DROP TABLE IF EXISTS analytics_top_companies;
 DROP TABLE IF EXISTS analytics_demand_by_date;
 DROP TABLE IF EXISTS analytics_country_position_matrix;
 
-CREATE TABLE analytics_clean_jobs
-STORED AS PARQUET
-LOCATION '${hiveconf:HDFS_BASE}/analytics/analytics_clean_jobs'
-AS
+-- Drop old physical intermediate tables from previous versions if they exist.
+DROP TABLE IF EXISTS analytics_clean_jobs;
+DROP TABLE IF EXISTS analytics_job_skills_exploded;
+
+-- Internal views: they avoid writing huge intermediate Parquet tables to HDFS
+-- and keep the EDA execution on HiveQL + Tez.
+DROP VIEW IF EXISTS analytics_clean_jobs_v;
+DROP VIEW IF EXISTS analytics_job_skills_exploded_v;
+
+CREATE VIEW analytics_clean_jobs_v AS
 SELECT
     job_link,
     last_processed_time,
@@ -89,10 +91,7 @@ SELECT
     END AS job_summary_clean
 FROM linkedin_jobs_enriched;
 
-CREATE TABLE analytics_job_skills_exploded
-STORED AS PARQUET
-LOCATION '${hiveconf:HDFS_BASE}/analytics/analytics_job_skills_exploded'
-AS
+CREATE VIEW analytics_job_skills_exploded_v AS
 SELECT
     job_link,
     search_country_clean,
@@ -102,7 +101,7 @@ SELECT
     company_clean,
     first_seen,
     trim(raw_skill) AS skill
-FROM analytics_clean_jobs
+FROM analytics_clean_jobs_v
 LATERAL VIEW explode(split(coalesce(job_skills_clean, ''), ',')) skill_table AS raw_skill
 WHERE trim(raw_skill) <> '';
 
@@ -110,78 +109,62 @@ CREATE TABLE analytics_data_characteristics
 STORED AS PARQUET
 LOCATION '${hiveconf:HDFS_BASE}/analytics/analytics_data_characteristics'
 AS
-SELECT 'total_rows' AS metric_name, CAST(COUNT(*) AS STRING) AS metric_value
-FROM analytics_clean_jobs
-UNION ALL
-SELECT 'feature_count', '16'
-UNION ALL
-SELECT 'feature_names',
-       'job_link,last_processed_time,got_summary,got_ner,is_being_worked,job_title,company,job_location,first_seen,search_city,search_country,search_position,job_level,job_type,job_skills,job_summary'
-UNION ALL
-SELECT 'distinct_countries', CAST(COUNT(DISTINCT search_country_clean) AS STRING)
-FROM analytics_clean_jobs
-WHERE search_country_clean <> 'unknown'
-UNION ALL
-SELECT 'distinct_positions', CAST(COUNT(DISTINCT search_position_clean) AS STRING)
-FROM analytics_clean_jobs
-WHERE search_position_clean <> 'unknown'
-UNION ALL
-SELECT 'distinct_companies', CAST(COUNT(DISTINCT company_clean) AS STRING)
-FROM analytics_clean_jobs
-WHERE company_clean <> 'unknown'
-UNION ALL
-SELECT 'rows_with_skills', CAST(COUNT(*) AS STRING)
-FROM analytics_clean_jobs
-WHERE job_skills_clean IS NOT NULL
-UNION ALL
-SELECT 'rows_with_summary', CAST(COUNT(*) AS STRING)
-FROM analytics_clean_jobs
-WHERE job_summary_clean IS NOT NULL
-UNION ALL
-SELECT 'min_first_seen', CAST(MIN(first_seen) AS STRING)
-FROM analytics_clean_jobs
-UNION ALL
-SELECT 'max_first_seen', CAST(MAX(first_seen) AS STRING)
-FROM analytics_clean_jobs
-;
+WITH agg AS (
+    SELECT
+        COUNT(*) AS total_rows,
+        COUNT(DISTINCT CASE WHEN search_country_clean <> 'unknown' THEN search_country_clean END) AS distinct_countries,
+        COUNT(DISTINCT CASE WHEN search_position_clean <> 'unknown' THEN search_position_clean END) AS distinct_positions,
+        COUNT(DISTINCT CASE WHEN company_clean <> 'unknown' THEN company_clean END) AS distinct_companies,
+        SUM(CASE WHEN job_skills_clean IS NOT NULL THEN 1 ELSE 0 END) AS rows_with_skills,
+        SUM(CASE WHEN job_summary_clean IS NOT NULL THEN 1 ELSE 0 END) AS rows_with_summary,
+        MIN(first_seen) AS min_first_seen,
+        MAX(first_seen) AS max_first_seen
+    FROM analytics_clean_jobs_v
+)
+SELECT 'total_rows' AS metric_name, CAST(total_rows AS STRING) AS metric_value FROM agg
+UNION ALL SELECT 'feature_count', '16'
+UNION ALL SELECT 'feature_names', 'job_link,last_processed_time,got_summary,got_ner,is_being_worked,job_title,company,job_location,first_seen,search_city,search_country,search_position,job_level,job_type,job_skills,job_summary'
+UNION ALL SELECT 'distinct_countries', CAST(distinct_countries AS STRING) FROM agg
+UNION ALL SELECT 'distinct_positions', CAST(distinct_positions AS STRING) FROM agg
+UNION ALL SELECT 'distinct_companies', CAST(distinct_companies AS STRING) FROM agg
+UNION ALL SELECT 'rows_with_skills', CAST(rows_with_skills AS STRING) FROM agg
+UNION ALL SELECT 'rows_with_summary', CAST(rows_with_summary AS STRING) FROM agg
+UNION ALL SELECT 'min_first_seen', CAST(min_first_seen AS STRING) FROM agg
+UNION ALL SELECT 'max_first_seen', CAST(max_first_seen AS STRING) FROM agg;
 
 CREATE TABLE analytics_null_coverage
 STORED AS PARQUET
 LOCATION '${hiveconf:HDFS_BASE}/analytics/analytics_null_coverage'
 AS
-SELECT 'job_title' AS column_name, COUNT(*) AS total_rows,
-       SUM(CASE WHEN job_title_clean = 'unknown' THEN 1 ELSE 0 END) AS missing_rows,
-       ROUND(100.0 * SUM(CASE WHEN job_title_clean = 'unknown' THEN 1 ELSE 0 END) / COUNT(*), 2) AS missing_pct
-FROM analytics_clean_jobs
-UNION ALL
-SELECT 'company', COUNT(*), SUM(CASE WHEN company_clean = 'unknown' THEN 1 ELSE 0 END),
-       ROUND(100.0 * SUM(CASE WHEN company_clean = 'unknown' THEN 1 ELSE 0 END) / COUNT(*), 2)
-FROM analytics_clean_jobs
-UNION ALL
-SELECT 'search_country', COUNT(*), SUM(CASE WHEN search_country_clean = 'unknown' THEN 1 ELSE 0 END),
-       ROUND(100.0 * SUM(CASE WHEN search_country_clean = 'unknown' THEN 1 ELSE 0 END) / COUNT(*), 2)
-FROM analytics_clean_jobs
-UNION ALL
-SELECT 'search_position', COUNT(*), SUM(CASE WHEN search_position_clean = 'unknown' THEN 1 ELSE 0 END),
-       ROUND(100.0 * SUM(CASE WHEN search_position_clean = 'unknown' THEN 1 ELSE 0 END) / COUNT(*), 2)
-FROM analytics_clean_jobs
-UNION ALL
-SELECT 'job_level', COUNT(*), SUM(CASE WHEN job_level_clean = 'unknown' THEN 1 ELSE 0 END),
-       ROUND(100.0 * SUM(CASE WHEN job_level_clean = 'unknown' THEN 1 ELSE 0 END) / COUNT(*), 2)
-FROM analytics_clean_jobs
-UNION ALL
-SELECT 'job_type', COUNT(*), SUM(CASE WHEN job_type_clean = 'unknown' THEN 1 ELSE 0 END),
-       ROUND(100.0 * SUM(CASE WHEN job_type_clean = 'unknown' THEN 1 ELSE 0 END) / COUNT(*), 2)
-FROM analytics_clean_jobs
-UNION ALL
-SELECT 'job_skills', COUNT(*), SUM(CASE WHEN job_skills_clean IS NULL THEN 1 ELSE 0 END),
-       ROUND(100.0 * SUM(CASE WHEN job_skills_clean IS NULL THEN 1 ELSE 0 END) / COUNT(*), 2)
-FROM analytics_clean_jobs
-UNION ALL
-SELECT 'job_summary', COUNT(*), SUM(CASE WHEN job_summary_clean IS NULL THEN 1 ELSE 0 END),
-       ROUND(100.0 * SUM(CASE WHEN job_summary_clean IS NULL THEN 1 ELSE 0 END) / COUNT(*), 2)
-FROM analytics_clean_jobs
-;
+WITH agg AS (
+    SELECT
+        COUNT(*) AS total_rows,
+        SUM(CASE WHEN job_title_clean = 'unknown' THEN 1 ELSE 0 END) AS job_title_missing,
+        SUM(CASE WHEN company_clean = 'unknown' THEN 1 ELSE 0 END) AS company_missing,
+        SUM(CASE WHEN search_country_clean = 'unknown' THEN 1 ELSE 0 END) AS search_country_missing,
+        SUM(CASE WHEN search_position_clean = 'unknown' THEN 1 ELSE 0 END) AS search_position_missing,
+        SUM(CASE WHEN job_level_clean = 'unknown' THEN 1 ELSE 0 END) AS job_level_missing,
+        SUM(CASE WHEN job_type_clean = 'unknown' THEN 1 ELSE 0 END) AS job_type_missing,
+        SUM(CASE WHEN job_skills_clean IS NULL THEN 1 ELSE 0 END) AS job_skills_missing,
+        SUM(CASE WHEN job_summary_clean IS NULL THEN 1 ELSE 0 END) AS job_summary_missing
+    FROM analytics_clean_jobs_v
+)
+SELECT 'job_title' AS column_name, total_rows, job_title_missing AS missing_rows,
+       ROUND(100.0 * job_title_missing / total_rows, 2) AS missing_pct FROM agg
+UNION ALL SELECT 'company', total_rows, company_missing,
+       ROUND(100.0 * company_missing / total_rows, 2) FROM agg
+UNION ALL SELECT 'search_country', total_rows, search_country_missing,
+       ROUND(100.0 * search_country_missing / total_rows, 2) FROM agg
+UNION ALL SELECT 'search_position', total_rows, search_position_missing,
+       ROUND(100.0 * search_position_missing / total_rows, 2) FROM agg
+UNION ALL SELECT 'job_level', total_rows, job_level_missing,
+       ROUND(100.0 * job_level_missing / total_rows, 2) FROM agg
+UNION ALL SELECT 'job_type', total_rows, job_type_missing,
+       ROUND(100.0 * job_type_missing / total_rows, 2) FROM agg
+UNION ALL SELECT 'job_skills', total_rows, job_skills_missing,
+       ROUND(100.0 * job_skills_missing / total_rows, 2) FROM agg
+UNION ALL SELECT 'job_summary', total_rows, job_summary_missing,
+       ROUND(100.0 * job_summary_missing / total_rows, 2) FROM agg;
 
 CREATE TABLE analytics_top_positions_global
 STORED AS PARQUET
@@ -192,7 +175,7 @@ SELECT
     COUNT(*) AS posting_count,
     COUNT(DISTINCT company_clean) AS company_count,
     COUNT(DISTINCT search_country_clean) AS country_count
-FROM analytics_clean_jobs
+FROM analytics_clean_jobs_v
 WHERE search_position_clean <> 'unknown'
 GROUP BY search_position_clean;
 
@@ -205,7 +188,7 @@ SELECT
     search_position_clean AS search_position,
     COUNT(*) AS posting_count,
     COUNT(DISTINCT company_clean) AS company_count
-FROM analytics_clean_jobs
+FROM analytics_clean_jobs_v
 WHERE search_country_clean <> 'unknown'
   AND search_position_clean <> 'unknown'
 GROUP BY search_country_clean, search_position_clean;
@@ -219,7 +202,7 @@ SELECT
     COUNT(*) AS skill_mentions,
     COUNT(DISTINCT job_link) AS posting_count,
     COUNT(DISTINCT search_country_clean) AS country_count
-FROM analytics_job_skills_exploded
+FROM analytics_job_skills_exploded_v
 GROUP BY skill;
 
 CREATE TABLE analytics_top_skills_by_country
@@ -231,7 +214,7 @@ SELECT
     skill,
     COUNT(*) AS skill_mentions,
     COUNT(DISTINCT job_link) AS posting_count
-FROM analytics_job_skills_exploded
+FROM analytics_job_skills_exploded_v
 WHERE search_country_clean <> 'unknown'
 GROUP BY search_country_clean, skill;
 
@@ -244,7 +227,7 @@ SELECT
     skill,
     COUNT(*) AS skill_mentions,
     COUNT(DISTINCT job_link) AS posting_count
-FROM analytics_job_skills_exploded
+FROM analytics_job_skills_exploded_v
 WHERE job_level_clean <> 'unknown'
 GROUP BY job_level_clean, skill;
 
@@ -252,12 +235,18 @@ CREATE TABLE analytics_job_type_distribution
 STORED AS PARQUET
 LOCATION '${hiveconf:HDFS_BASE}/analytics/analytics_job_type_distribution'
 AS
+WITH counts AS (
+    SELECT
+        job_type_clean AS job_type,
+        COUNT(*) AS posting_count
+    FROM analytics_clean_jobs_v
+    GROUP BY job_type_clean
+)
 SELECT
-    job_type_clean AS job_type,
-    COUNT(*) AS posting_count,
-    ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) AS posting_pct
-FROM analytics_clean_jobs
-GROUP BY job_type_clean;
+    job_type,
+    posting_count,
+    ROUND(100.0 * posting_count / SUM(posting_count) OVER (), 2) AS posting_pct
+FROM counts;
 
 CREATE TABLE analytics_job_level_distribution
 STORED AS PARQUET
@@ -267,7 +256,7 @@ SELECT
     search_country_clean AS search_country,
     job_level_clean AS job_level,
     COUNT(*) AS posting_count
-FROM analytics_clean_jobs
+FROM analytics_clean_jobs_v
 WHERE search_country_clean <> 'unknown'
 GROUP BY search_country_clean, job_level_clean;
 
@@ -280,7 +269,7 @@ SELECT
     COUNT(*) AS posting_count,
     COUNT(DISTINCT search_country_clean) AS country_count,
     COUNT(DISTINCT search_position_clean) AS position_count
-FROM analytics_clean_jobs
+FROM analytics_clean_jobs_v
 WHERE company_clean <> 'unknown'
 GROUP BY company_clean;
 
@@ -293,7 +282,7 @@ SELECT
     search_country_clean AS search_country,
     search_position_clean AS search_position,
     COUNT(*) AS posting_count
-FROM analytics_clean_jobs
+FROM analytics_clean_jobs_v
 WHERE first_seen IS NOT NULL
   AND search_country_clean <> 'unknown'
   AND search_position_clean <> 'unknown'
@@ -308,7 +297,7 @@ SELECT
     search_position_clean AS search_position,
     COUNT(*) AS posting_count,
     COUNT(DISTINCT company_clean) AS company_count
-FROM analytics_clean_jobs
+FROM analytics_clean_jobs_v
 WHERE search_country_clean <> 'unknown'
   AND search_position_clean <> 'unknown'
 GROUP BY search_country_clean, search_position_clean;
