@@ -4,6 +4,12 @@ LOCATION '${hiveconf:HDFS_BASE}/warehouse';
 USE ${hiveconf:HIVE_DB};
 
 SET hive.execution.engine=tez;
+SET tez.counters.max=10000;
+SET hive.exec.parallel=false;
+SET hive.stats.autogather=false;
+SET hive.compute.query.using.stats=false;
+SET hive.vectorized.execution.enabled=false;
+SET hive.vectorized.execution.reduce.enabled=false;
 SET hive.exec.compress.output=true;
 SET hive.exec.parallel=false;
 SET hive.vectorized.execution.enabled=false;
