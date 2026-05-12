@@ -5,6 +5,12 @@ USE ${hiveconf:HIVE_DB};
 
 SET hive.execution.engine=tez;
 SET hive.exec.compress.output=true;
+SET hive.exec.parallel=false;
+SET hive.vectorized.execution.enabled=false;
+SET hive.vectorized.execution.reduce.enabled=false;
+SET hive.compute.query.using.stats=false;
+SET hive.stats.autogather=false;
+SET tez.task.generate.counters=false;
 SET parquet.compression=SNAPPY;
 SET hive.vectorized.execution.enabled=true;
 SET hive.vectorized.execution.reduce.enabled=true;
