@@ -63,7 +63,10 @@ NUMERIC_COLS: Tuple[str, ...] = (
 )
 
 CV_FOLDS = 3
-CV_PARALLELISM = 2
+# Up from 2 to 4: with 27-combination grids the wall time grows
+# proportionally, so we let Spark schedule more candidate fits in
+# parallel inside each fold.
+CV_PARALLELISM = 4
 RANDOM_SEED = 42
 
 # Soft-voting ensemble configuration. NB is excluded because its raw /
@@ -140,7 +143,13 @@ def build_feature_stages(scaler: Optional[str]) -> List:
 
 
 def make_rf() -> Tuple[Pipeline, list, RandomForestClassifier]:
-    """Build the Random Forest pipeline and tuning grid."""
+    """Build the Random Forest pipeline and tuning grid.
+
+    Grid follows the course rubric: 3 hyperparameters x 3 values =
+    27 combinations, with one algorithm hyperparameter
+    (``numTrees`` — size of the ensemble) and two model
+    hyperparameters (``maxDepth``, ``minInstancesPerNode``).
+    """
     stages = build_feature_stages(scaler=None)
     rf = RandomForestClassifier(
         labelCol=LABEL_COL,
@@ -151,6 +160,7 @@ def make_rf() -> Tuple[Pipeline, list, RandomForestClassifier]:
         ParamGridBuilder()
         .addGrid(rf.numTrees, [50, 100, 200])
         .addGrid(rf.maxDepth, [5, 10, 15])
+        .addGrid(rf.minInstancesPerNode, [1, 5, 10])
         .build()
     )
     return Pipeline(stages=stages + [rf]), grid, rf
@@ -159,10 +169,11 @@ def make_rf() -> Tuple[Pipeline, list, RandomForestClassifier]:
 def make_gbt() -> Tuple[Pipeline, list, GBTClassifier]:
     """Build the Gradient Boosted Trees pipeline and tuning grid.
 
-    GBT typically outperforms a vanilla Random Forest on tabular data
-    with mixed numeric and one-hot categorical features. The grid is
-    intentionally small because each candidate model takes noticeably
-    longer to fit than its RF counterpart.
+    Grid: 3 x 3 x 3 = 27 combinations. ``maxIter`` is excluded
+    because the rubric forbids iteration counts as hyperparameters;
+    we use ``stepSize`` (learning rate) as the algorithm
+    hyperparameter and ``maxDepth`` + ``minInstancesPerNode`` as the
+    model ones.
     """
     stages = build_feature_stages(scaler=None)
     gbt = GBTClassifier(
@@ -172,38 +183,48 @@ def make_gbt() -> Tuple[Pipeline, list, GBTClassifier]:
     )
     grid = (
         ParamGridBuilder()
-        .addGrid(gbt.maxIter, [20, 50])
-        .addGrid(gbt.maxDepth, [5, 8])
+        .addGrid(gbt.stepSize, [0.05, 0.1, 0.2])
+        .addGrid(gbt.maxDepth, [3, 5, 8])
+        .addGrid(gbt.minInstancesPerNode, [1, 5, 10])
         .build()
     )
     return Pipeline(stages=stages + [gbt]), grid, gbt
 
 
 def make_svm() -> Tuple[Pipeline, list, LinearSVC]:
-    """Build the Linear SVC pipeline and tuning grid."""
+    """Build the Linear SVC pipeline and tuning grid.
+
+    Grid: 3 x 3 x 3 = 27 combinations. ``maxIter`` is excluded
+    (rubric). ``aggregationDepth`` is the algorithm hyperparameter
+    (it controls how distributed gradient aggregations are reduced),
+    ``regParam`` and ``threshold`` are the two model hyperparameters
+    (L2 strength and decision-margin threshold respectively).
+    """
     stages = build_feature_stages(scaler="standard")
     svm = LinearSVC(labelCol=LABEL_COL, featuresCol="features")
     grid = (
         ParamGridBuilder()
         .addGrid(svm.regParam, [0.001, 0.01, 0.1])
-        .addGrid(svm.maxIter, [50, 100])
+        .addGrid(svm.threshold, [-0.2, 0.0, 0.2])
+        .addGrid(svm.aggregationDepth, [2, 3, 4])
         .build()
     )
     return Pipeline(stages=stages + [svm]), grid, svm
 
 
 def make_nb() -> Tuple[Pipeline, list, NaiveBayes]:
-    """Build the Gaussian Naive Bayes pipeline and tuning grid.
+    """Build the Naive Bayes pipeline and tuning grid.
 
-    Gaussian NB models each feature as a per-class Normal distribution
-    and is the right NB variant for our mixed continuous + one-hot
-    feature space. Multinomial NB would treat the ratio features
-    (``skills_per_posting`` etc.) as nonsensical multinomial counts.
-    Gaussian NB does not require non-negative inputs, so no extra
-    scaler is needed; ``raw_features`` is fed in directly.
-    ``smoothing`` here controls variance smoothing added to each
-    feature's per-class variance to avoid division by zero on
-    near-constant features.
+    Grid: 3 x 3 x 3 = 27 combinations. ``modelType`` is the
+    algorithm hyperparameter (we try gaussian / multinomial /
+    complement — bernoulli is excluded because it requires binary
+    features). ``smoothing`` and ``thresholds`` are model
+    hyperparameters: the first is variance / Laplace smoothing, the
+    second shifts the decision boundary which is useful given our
+    13/87 class imbalance.
+
+    All numeric features and one-hot encodings are non-negative, so
+    multinomial and complement variants run without an extra scaler.
     """
     stages = build_feature_stages(scaler=None)
     nb = NaiveBayes(
@@ -213,14 +234,21 @@ def make_nb() -> Tuple[Pipeline, list, NaiveBayes]:
     )
     grid = (
         ParamGridBuilder()
-        .addGrid(nb.smoothing, [0.5, 1.0, 2.0])
+        .addGrid(nb.smoothing, [0.1, 1.0, 5.0])
+        .addGrid(nb.modelType, ["gaussian", "multinomial", "complement"])
+        .addGrid(nb.thresholds, [[0.3, 0.7], [0.5, 0.5], [0.7, 0.3]])
         .build()
     )
     return Pipeline(stages=stages + [nb]), grid, nb
 
 
-def evaluate(predictions: DataFrame) -> Tuple[float, float, float]:
-    """Compute accuracy, F1, and AUC on the prediction frame."""
+def evaluate(predictions: DataFrame) -> Tuple[float, float, float, float]:
+    """Compute accuracy, F1, AUC-ROC, and AUC-PR on the predictions.
+
+    Both AUC metrics are reported because the course rubric requires
+    "Area Under ROC and Area Under PR for binary classification".
+    AUC-PR is especially informative on our 13/87 imbalanced label.
+    """
     acc = MulticlassClassificationEvaluator(
         labelCol=LABEL_COL,
         predictionCol="prediction",
@@ -232,19 +260,24 @@ def evaluate(predictions: DataFrame) -> Tuple[float, float, float]:
         metricName="f1",
     ).evaluate(predictions)
 
-    # rawPrediction is produced by RF and LinearSVC but not by NaiveBayes
-    # (which exposes probability instead). Fall back to NaN when AUC
-    # cannot be computed.
-    auc: float
+    # rawPrediction is produced by RF, GBT, and LinearSVC; Spark's
+    # NaiveBayes also exposes it. Fall back to NaN in the unlikely
+    # event it is missing so the loop still completes.
     if "rawPrediction" in predictions.columns:
-        auc = BinaryClassificationEvaluator(
+        auc_roc = BinaryClassificationEvaluator(
             labelCol=LABEL_COL,
             rawPredictionCol="rawPrediction",
             metricName="areaUnderROC",
         ).evaluate(predictions)
+        auc_pr = BinaryClassificationEvaluator(
+            labelCol=LABEL_COL,
+            rawPredictionCol="rawPrediction",
+            metricName="areaUnderPR",
+        ).evaluate(predictions)
     else:
-        auc = math.nan
-    return acc, f1, auc
+        auc_roc = math.nan
+        auc_pr = math.nan
+    return acc, f1, auc_roc, auc_pr
 
 
 def confusion_pdf(predictions: DataFrame):
@@ -351,6 +384,19 @@ def write_feature_importance(
     return True
 
 
+def _format_param_value(value: object) -> str:
+    """Render a param value for human-readable CSV/TXT output.
+
+    NaiveBayes' ``thresholds`` parameter is an ``Array[Double]`` —
+    rendering it as the default Python ``str(list)`` would inject
+    commas that break CSV columns. We collapse list values into a
+    pipe-separated string instead so each row stays one cell wide.
+    """
+    if isinstance(value, (list, tuple)):
+        return "|".join(str(v) for v in value)
+    return str(value)
+
+
 def write_cv_grid(
     cv_model,
     grid: list,
@@ -383,7 +429,8 @@ def write_cv_grid(
         writer.writerow(param_keys + ["mean_f1"])
         for params, score in rows:
             writer.writerow(
-                [params.get(key, "") for key in param_keys] + [f"{score:.6f}"]
+                [_format_param_value(params.get(key, "")) for key in param_keys]
+                + [f"{score:.6f}"]
             )
 
 
@@ -415,9 +462,10 @@ def train_one(
     cv_model = cv.fit(train)
     predictions = cv_model.transform(test)
 
-    acc, f1, auc = evaluate(predictions)
+    acc, f1, auc_roc, auc_pr = evaluate(predictions)
     print(
-        f"[stage3.train] {name}: accuracy={acc:.4f}  f1={f1:.4f}  auc={auc:.4f}",
+        f"[stage3.train] {name}: accuracy={acc:.4f}  f1={f1:.4f}  "
+        f"auc_roc={auc_roc:.4f}  auc_pr={auc_pr:.4f}",
         flush=True,
     )
 
@@ -425,7 +473,9 @@ def train_one(
     print(f"[stage3.train] {name}: saving best model -> {model_path}", flush=True)
     cv_model.bestModel.write().overwrite().save(model_path)
 
-    metrics_writer.writerow([name, f"{acc:.6f}", f"{f1:.6f}", f"{auc:.6f}"])
+    metrics_writer.writerow(
+        [name, f"{acc:.6f}", f"{f1:.6f}", f"{auc_roc:.6f}", f"{auc_pr:.6f}"]
+    )
 
     params = extract_best_params(cv_model, classifier)
     params_path = out_dir / f"stage3_{name}_best_params.txt"
@@ -500,20 +550,25 @@ def build_ensemble(
     )
 
 
-def evaluate_ensemble(predictions: DataFrame) -> Tuple[float, float, float]:
-    """Accuracy / F1 / AUC for the soft-voted ensemble."""
+def evaluate_ensemble(predictions: DataFrame) -> Tuple[float, float, float, float]:
+    """Accuracy / F1 / AUC-ROC / AUC-PR for the soft-voted ensemble."""
     acc = MulticlassClassificationEvaluator(
         labelCol=LABEL_COL, predictionCol="prediction", metricName="accuracy"
     ).evaluate(predictions)
     f1 = MulticlassClassificationEvaluator(
         labelCol=LABEL_COL, predictionCol="prediction", metricName="f1"
     ).evaluate(predictions)
-    auc = BinaryClassificationEvaluator(
+    auc_roc = BinaryClassificationEvaluator(
         labelCol=LABEL_COL,
         rawPredictionCol="prob_ensemble",
         metricName="areaUnderROC",
     ).evaluate(predictions)
-    return acc, f1, auc
+    auc_pr = BinaryClassificationEvaluator(
+        labelCol=LABEL_COL,
+        rawPredictionCol="prob_ensemble",
+        metricName="areaUnderPR",
+    ).evaluate(predictions)
+    return acc, f1, auc_roc, auc_pr
 
 
 def main() -> None:
@@ -544,7 +599,7 @@ def main() -> None:
     trained_models: Dict[str, PipelineModel] = {}
     with metrics_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["model", "accuracy", "f1", "auc"])
+        writer.writerow(["model", "accuracy", "f1", "auc_roc", "auc_pr"])
         for name, builder in (
             ("rf", make_rf),
             ("gbt", make_gbt),
@@ -571,14 +626,20 @@ def main() -> None:
             flush=True,
         )
         ensemble_pred = build_ensemble(trained_models, test, ENSEMBLE_MEMBERS)
-        acc, f1, auc = evaluate_ensemble(ensemble_pred)
+        acc, f1, auc_roc, auc_pr = evaluate_ensemble(ensemble_pred)
         print(
             f"[stage3.train] {ENSEMBLE_NAME}: accuracy={acc:.4f}  "
-            f"f1={f1:.4f}  auc={auc:.4f}",
+            f"f1={f1:.4f}  auc_roc={auc_roc:.4f}  auc_pr={auc_pr:.4f}",
             flush=True,
         )
         writer.writerow(
-            [ENSEMBLE_NAME, f"{acc:.6f}", f"{f1:.6f}", f"{auc:.6f}"]
+            [
+                ENSEMBLE_NAME,
+                f"{acc:.6f}",
+                f"{f1:.6f}",
+                f"{auc_roc:.6f}",
+                f"{auc_pr:.6f}",
+            ]
         )
         confusion_pdf(ensemble_pred).to_csv(
             out_dir / f"stage3_{ENSEMBLE_NAME}_confusion.csv", index=False

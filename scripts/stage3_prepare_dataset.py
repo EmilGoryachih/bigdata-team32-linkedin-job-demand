@@ -36,8 +36,9 @@ MIN_POSTINGS_PER_GROUP = 5
 HIGH_DEMAND_QUANTILE = 0.75
 
 # Fraction of (country, position) groups assigned to the training
-# split. The remainder is the held-out test set.
-TRAIN_FRACTION = 0.8
+# split. The remainder is the held-out test set. Set to 0.7 to match
+# the course rubric's default 70/30 split.
+TRAIN_FRACTION = 0.7
 
 RANDOM_SEED = 42
 
