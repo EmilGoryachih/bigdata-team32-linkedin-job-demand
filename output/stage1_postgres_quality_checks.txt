@@ -1,0 +1,25 @@
+table_name	row_count
+linkedin_job_postings	1348454
+job_skills	1296381
+job_summary	1297332
+
+table_name	distinct_job_links
+linkedin_job_postings	1348454
+job_summary	1297332
+job_skills	1296381
+
+min_first_seen	max_first_seen	min_last_processed_time	max_last_processed_time
+2024-01-12	2024-01-17	2024-01-19 09:45:09.215838+00:00	2024-01-21 17:37:21.080491+00:00
+
+postings_total	postings_with_skills	postings_with_summary
+1348454	1296381	1297332
+
+job_level	cnt
+Mid senior	1204445
+Associate	144009
+
+job_type	cnt
+Onsite	1337633
+Hybrid	6562
+Remote	4259
+

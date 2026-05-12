@@ -1,0 +1,25 @@
+source,search_country,search_position,true_label,pred_rf,pred_gbt,pred_svm,pred_nb,pred_ensemble
+crafted,germany,product manager,0,0,0,0,1,0
+crafted,india,software engineer,0,0,0,0,1,0
+crafted,united kingdom,data scientist,0,0,0,0,0,0
+crafted,united states,software engineer,0,0,0,1,0,0
+held_out,australia,clinical therapist,0,0,0,0,0,0
+held_out,australia,electrical-design engineer,0,0,0,0,0,0
+held_out,australia,insurance clerk,0,0,0,0,0,0
+held_out,canada,manager employee welfare,0,0,0,0,0,0
+held_out,canada,plumber supervisor,0,0,0,0,0,0
+held_out,canada,stock-control supervisor,0,0,0,0,0,0
+held_out,canada,supervisor cutting department,0,0,0,0,0,0
+held_out,united kingdom,claims clerk,0,0,0,0,0,0
+held_out,united kingdom,flight engineer,0,0,0,0,0,0
+held_out,united states,actor,0,0,0,1,0,0
+held_out,united states,chef,1,0,1,1,1,0
+held_out,united states,chiropractor assistant,1,0,1,1,0,1
+held_out,united states,currency counter,0,0,0,1,1,0
+held_out,united states,express clerk,0,0,0,1,1,0
+held_out,united states,field contractor,1,0,1,1,1,0
+held_out,united states,ophthalmic technician,0,0,0,1,0,0
+held_out,united states,psychologist educational,1,0,1,1,0,0
+held_out,united states,supervisor preparation department,1,0,0,1,1,0
+held_out,united states,testing and analysis department supervisor,0,0,0,0,1,0
+held_out,united states,vault custodian,0,0,1,1,1,1

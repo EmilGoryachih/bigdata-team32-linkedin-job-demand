@@ -1,0 +1,8 @@
+featuresCol=raw_features
+labelCol=high_demand
+modelType=complement
+predictionCol=prediction
+probabilityCol=probability
+rawPredictionCol=rawPrediction
+smoothing=1.0
+thresholds=[0.7, 0.3]

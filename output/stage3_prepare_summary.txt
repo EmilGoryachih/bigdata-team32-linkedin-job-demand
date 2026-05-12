@@ -1,0 +1,10 @@
+aggregation=country_position
+min_postings_per_group=5
+high_demand_quantile=0.75
+rows_before_filter=6177
+rows_after_filter=4426
+train_rows=3074
+test_rows=1352
+split_seed=42
+train_path=/user/team32/linkedin/ml/dataset_train
+test_path=/user/team32/linkedin/ml/dataset_test

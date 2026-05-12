@@ -1,0 +1,27 @@
+Superset Hive database:
+team32_linkedin
+
+Primary source table:
+team32_linkedin.linkedin_jobs_enriched
+
+Hive analytics tables:
+team32_linkedin.analytics_data_characteristics
+team32_linkedin.analytics_null_coverage
+team32_linkedin.analytics_clean_jobs
+team32_linkedin.analytics_job_skills_exploded
+team32_linkedin.analytics_top_positions_global
+team32_linkedin.analytics_top_positions_by_country
+team32_linkedin.analytics_top_skills_global
+team32_linkedin.analytics_top_skills_by_country
+team32_linkedin.analytics_skills_by_job_level
+team32_linkedin.analytics_job_type_distribution
+team32_linkedin.analytics_job_level_distribution
+team32_linkedin.analytics_top_companies
+team32_linkedin.analytics_demand_by_date
+team32_linkedin.analytics_country_position_matrix
+
+Hive analytics HDFS base:
+/user/team32/linkedin/analytics
+
+Spark analytics HDFS base:
+/user/team32/linkedin/analytics_spark

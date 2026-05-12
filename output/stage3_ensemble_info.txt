@@ -1,0 +1,4 @@
+members=rf,gbt,svm
+strategy=soft_voting_mean_of_positive_class_probability
+threshold=0.5
+note=NB excluded; its raw/probability outputs are not well-calibrated on this dataset.
