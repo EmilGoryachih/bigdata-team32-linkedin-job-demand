@@ -63,10 +63,12 @@ NUMERIC_COLS: Tuple[str, ...] = (
 )
 
 CV_FOLDS = 3
-# Up from 2 to 4: with 27-combination grids the wall time grows
-# proportionally, so we let Spark schedule more candidate fits in
-# parallel inside each fold.
-CV_PARALLELISM = 4
+# Kept at 2: with 27-combination grids and LinearSVC's OWLQN optimiser,
+# higher parallelism inflates driver memory and on a shared YARN
+# cluster pushes the driver past its container limit (observed:
+# "Cannot call methods on a stopped SparkContext" mid-SVM fit). 2 is
+# the sweet spot between throughput and stability on hadoop-03.
+CV_PARALLELISM = 2
 RANDOM_SEED = 42
 
 # Soft-voting ensemble configuration. NB is excluded because its raw /
@@ -204,7 +206,12 @@ def make_svm() -> Tuple[Pipeline, list, LinearSVC]:
     svm = LinearSVC(labelCol=LABEL_COL, featuresCol="features")
     grid = (
         ParamGridBuilder()
-        .addGrid(svm.regParam, [0.001, 0.01, 0.1])
+        # regParam=0.001 was dropped: it under-regularises and the OWLQN
+        # optimiser then takes many more iterations to converge, which
+        # blew up driver memory and crashed the SparkContext on the
+        # shared cluster. 0.01 is still a weak prior, sufficient to
+        # show the regularisation effect across the grid.
+        .addGrid(svm.regParam, [0.01, 0.1, 1.0])
         .addGrid(svm.threshold, [-0.2, 0.0, 0.2])
         .addGrid(svm.aggregationDepth, [2, 3, 4])
         .build()
