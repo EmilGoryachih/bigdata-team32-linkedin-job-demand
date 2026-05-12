@@ -3,7 +3,7 @@ LOCATION '${hiveconf:HDFS_BASE}/warehouse';
 
 USE ${hiveconf:HIVE_DB};
 
-SET hive.execution.engine=tez;
+SET hive.execution.engine=mr;
 SET hive.exec.compress.output=true;
 SET parquet.compression=SNAPPY;
 
