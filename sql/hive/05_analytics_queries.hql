@@ -92,9 +92,7 @@ SELECT
     trim(raw_skill) AS skill
 FROM analytics_clean_jobs
 LATERAL VIEW explode(split(coalesce(job_skills_clean, ''), ',')) skill_table AS raw_skill
-WHERE trim(raw_skill) <> ''
-CLUSTER BY trim(raw_skill)
-;
+WHERE trim(raw_skill) <> '';
 
 CREATE TABLE analytics_data_characteristics
 STORED AS PARQUET
