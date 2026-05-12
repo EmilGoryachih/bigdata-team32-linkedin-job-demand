@@ -47,7 +47,7 @@ export_csv() {
 }
 
 echo "Cleaning old Hive analytics HDFS directory..."
-hdfs dfs -rm -r -f "$HDFS_BASE/analytics"
+hdfs dfs -rm -r -skipTrash -f "$HDFS_BASE/analytics"
 hdfs dfs -mkdir -p "$HDFS_BASE/analytics"
 
 echo "Creating Hive dashboard analytics tables..."
