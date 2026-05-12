@@ -268,6 +268,125 @@ def extract_best_params(cv_model, classifier) -> Dict[str, object]:
     }
 
 
+def feature_names_from_pipeline(model: PipelineModel) -> List[str]:
+    """Recover the per-slot feature names of the assembled feature vector.
+
+    Walks the fitted pipeline, picks up the categorical labels from each
+    StringIndexerModel and the assembled input order from the
+    VectorAssembler, and reconstructs a human-readable name for every
+    column of ``featureImportances``. Best-effort — if the pipeline has
+    an unexpected shape the function falls back to generic names.
+    """
+    idx_labels: Dict[str, List[str]] = {}  # indexer output col -> labels
+    oh_input: Dict[str, str] = {}          # oh output col -> indexer output col
+    assembler_inputs: List[str] = []
+
+    for stage in model.stages:
+        cls_name = type(stage).__name__
+        if cls_name == "StringIndexerModel":
+            try:
+                idx_labels[stage.getOutputCol()] = list(stage.labels)
+            except Exception:  # pylint: disable=broad-except
+                pass
+        elif cls_name == "OneHotEncoderModel":
+            try:
+                oh_input[stage.getOutputCol()] = stage.getInputCol()
+            except Exception:  # pylint: disable=broad-except
+                pass
+        elif cls_name == "VectorAssembler":
+            try:
+                assembler_inputs = list(stage.getInputCols())
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+    names: List[str] = []
+    for col in assembler_inputs:
+        if col in oh_input:
+            base = col[:-3] if col.endswith("_oh") else col
+            for label in idx_labels.get(oh_input[col], []):
+                names.append(f"{base}={label}")
+        else:
+            names.append(col)
+    return names
+
+
+def write_feature_importance(
+    model: PipelineModel, model_name: str, out_dir: Path
+) -> bool:
+    """Persist sorted feature importances for tree-based classifiers.
+
+    Returns ``True`` when a file was written (RF, GBT) and ``False``
+    when the classifier does not expose ``featureImportances`` (SVM,
+    Gaussian NB).
+    """
+    classifier = model.stages[-1]
+    if not hasattr(classifier, "featureImportances"):
+        return False
+
+    importances = classifier.featureImportances.toArray()
+    names = feature_names_from_pipeline(model)
+
+    # Reconcile lengths defensively — the heuristic name extraction can
+    # disagree with the actual vector length under unusual encoder
+    # configurations.
+    n_features = len(importances)
+    if len(names) < n_features:
+        names = names + [
+            f"feature_{i}" for i in range(len(names), n_features)
+        ]
+    elif len(names) > n_features:
+        names = names[:n_features]
+
+    pairs = sorted(
+        zip(names, importances),
+        key=lambda pair: float(pair[1]),
+        reverse=True,
+    )
+    out_path = out_dir / f"stage3_{model_name}_feature_importance.csv"
+    with out_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["feature", "importance"])
+        for feature, importance in pairs:
+            writer.writerow([feature, f"{float(importance):.6f}"])
+    return True
+
+
+def write_cv_grid(
+    cv_model,
+    grid: list,
+    classifier,
+    model_name: str,
+    out_dir: Path,
+) -> None:
+    """Write the full CV parameter grid with mean F1 per combination.
+
+    ``cv_model.avgMetrics`` gives the mean validation F1 across the K
+    folds for every entry in ``grid``, in the same order. The output
+    file makes the tuning process auditable: which combinations were
+    tried and how each one scored.
+    """
+    scores = list(cv_model.avgMetrics)
+    rows: List[Tuple[Dict[str, object], float]] = []
+    for combo, score in zip(grid, scores):
+        params = {
+            param.name: value
+            for param, value in combo.items()
+            if param.parent == classifier.uid
+        }
+        rows.append((params, float(score)))
+    rows.sort(key=lambda row: row[1], reverse=True)
+
+    param_keys = sorted({key for params, _ in rows for key in params})
+    out_path = out_dir / f"stage3_{model_name}_cv_grid.csv"
+    with out_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(param_keys + ["mean_f1"])
+        for params, score in rows:
+            writer.writerow(
+                [params.get(key, "") for key in param_keys] + [f"{score:.6f}"]
+            )
+
+
 def train_one(
     name: str,
     pipeline: Pipeline,
@@ -313,6 +432,11 @@ def train_one(
     with params_path.open("w", encoding="utf-8") as fh:
         for key, value in sorted(params.items()):
             fh.write(f"{key}={value}\n")
+
+    # Full CV grid (per-combination mean F1) and tree-based feature
+    # importance. The latter is a no-op for SVM / Gaussian NB.
+    write_cv_grid(cv_model, grid, classifier, name, out_dir)
+    write_feature_importance(cv_model.bestModel, name, out_dir)
 
     confusion = confusion_pdf(predictions)
     confusion.to_csv(out_dir / f"stage3_{name}_confusion.csv", index=False)
