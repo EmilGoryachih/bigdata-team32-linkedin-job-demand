@@ -18,7 +18,7 @@ import math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from pyspark.ml import Pipeline
+from pyspark.ml import Pipeline, PipelineModel
 from pyspark.ml.classification import (
     GBTClassifier,
     LinearSVC,
@@ -35,6 +35,7 @@ from pyspark.ml.feature import (
     StringIndexer,
     VectorAssembler,
 )
+from pyspark.ml.functions import vector_to_array
 from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -48,27 +49,29 @@ CATEGORICAL_COLS: Tuple[str, ...] = (
     "search_position",
 )
 
-# Numeric feature columns. ``group_count`` is deliberately excluded —
-# the label is a deterministic function of it, so including it would be
-# trivial leakage. The lag/rolling variants are safe because they only
-# look at past time buckets.
+# Numeric feature columns. ``group_count``, ``distinct_companies``,
+# and ``distinct_skills`` are deliberately excluded — the label is a
+# deterministic function of ``group_count``, and the raw distinct
+# counts are bounded by it (their upper bound is group_count, so they
+# leak the label). We keep the per-posting ratio variants instead.
 NUMERIC_COLS: Tuple[str, ...] = (
-    "year",
-    "month",
-    "week_of_year",
-    "day_of_week",
-    "quarter",
-    "is_weekend",
-    "lag_count_1",
-    "lag_count_4",
-    "rolling_mean_count_4",
-    "lag_distinct_companies_1",
-    "lag_distinct_skills_1",
+    "summary_coverage",
+    "distinct_job_levels",
+    "distinct_job_types",
+    "skills_per_posting",
+    "companies_per_posting",
 )
 
 CV_FOLDS = 3
 CV_PARALLELISM = 2
 RANDOM_SEED = 42
+
+# Soft-voting ensemble configuration. NB is excluded because its raw /
+# probability outputs are not well-calibrated for this dataset, so it
+# would only drag the averaged score down.
+ENSEMBLE_NAME = "ensemble"
+ENSEMBLE_MEMBERS: Tuple[str, ...] = ("rf", "gbt", "svm")
+ENSEMBLE_THRESHOLD = 0.5
 
 
 def parse_args() -> argparse.Namespace:
@@ -194,14 +197,13 @@ def make_nb() -> Tuple[Pipeline, list, NaiveBayes]:
 
     Gaussian NB models each feature as a per-class Normal distribution
     and is the right NB variant for our mixed continuous + one-hot
-    feature space. Multinomial NB (the previous choice) treats feature
-    values as counts from a fixed vocabulary, which makes no semantic
-    sense for ``year``, ``lag_count_*``, etc. — it produced inverted
-    predictions (AUC ≈ 0.05) on the previous run. Gaussian NB also
-    does not require non-negative inputs, so no extra scaler is
-    needed; ``raw_features`` is fed in directly. ``smoothing`` here
-    controls variance smoothing added to each feature's per-class
-    variance to avoid division by zero on near-constant features.
+    feature space. Multinomial NB would treat the ratio features
+    (``skills_per_posting`` etc.) as nonsensical multinomial counts.
+    Gaussian NB does not require non-negative inputs, so no extra
+    scaler is needed; ``raw_features`` is fed in directly.
+    ``smoothing`` here controls variance smoothing added to each
+    feature's per-class variance to avoid division by zero on
+    near-constant features.
     """
     stages = build_feature_stages(scaler=None)
     nb = NaiveBayes(
@@ -276,8 +278,8 @@ def train_one(
     ml_base: str,
     out_dir: Path,
     metrics_writer,
-) -> None:
-    """Run CV on one estimator, evaluate, persist artifacts."""
+) -> PipelineModel:
+    """Run CV on one estimator, evaluate, persist artifacts, return best model."""
     print(f"[stage3.train] === {name.upper()}: cross-validated tuning ===", flush=True)
 
     evaluator = MulticlassClassificationEvaluator(
@@ -315,6 +317,80 @@ def train_one(
     confusion = confusion_pdf(predictions)
     confusion.to_csv(out_dir / f"stage3_{name}_confusion.csv", index=False)
 
+    return cv_model.bestModel
+
+
+def _positive_class_prob(pred: DataFrame, model_name: str) -> DataFrame:
+    """Return a ``(row_id, prob_<model_name>)`` frame with ``P(class=1)``.
+
+    Tree models and Naive Bayes expose a ``probability`` vector; LinearSVC
+    only exposes ``rawPrediction`` (signed margins), so we squash the
+    positive-class margin through a sigmoid to get a comparable scalar
+    in ``[0, 1]``.
+    """
+    out_col = f"prob_{model_name}"
+    if "probability" in pred.columns:
+        return (
+            pred.withColumn("_pa", vector_to_array("probability"))
+            .withColumn(out_col, F.col("_pa")[1])
+            .select("row_id", out_col)
+        )
+    return (
+        pred.withColumn("_ra", vector_to_array("rawPrediction"))
+        .withColumn(out_col, F.expr("1.0 / (1.0 + exp(-_ra[1]))"))
+        .select("row_id", out_col)
+    )
+
+
+def build_ensemble(
+    trained_models: Dict[str, PipelineModel],
+    test: DataFrame,
+    member_names: Tuple[str, ...],
+) -> DataFrame:
+    """Soft-vote ensemble: average ``P(class=1)`` across the members."""
+    test_with_id = test.withColumn(
+        "row_id", F.monotonically_increasing_id()
+    ).cache()
+    # Force IDs to materialise so the same row_id is seen by every model
+    # transform below (monotonically_increasing_id is per-partition; once
+    # the DataFrame is cached the values are frozen).
+    test_with_id.count()
+
+    ensemble = test_with_id.select("row_id", LABEL_COL)
+    for name in member_names:
+        pred = trained_models[name].transform(test_with_id)
+        ensemble = ensemble.join(_positive_class_prob(pred, name), "row_id")
+
+    prob_cols = [F.col(f"prob_{n}") for n in member_names]
+    return (
+        ensemble.withColumn(
+            "prob_ensemble",
+            sum(prob_cols) / float(len(member_names)),
+        )
+        .withColumn(
+            "prediction",
+            F.when(
+                F.col("prob_ensemble") >= F.lit(ENSEMBLE_THRESHOLD), F.lit(1.0)
+            ).otherwise(F.lit(0.0)),
+        )
+    )
+
+
+def evaluate_ensemble(predictions: DataFrame) -> Tuple[float, float, float]:
+    """Accuracy / F1 / AUC for the soft-voted ensemble."""
+    acc = MulticlassClassificationEvaluator(
+        labelCol=LABEL_COL, predictionCol="prediction", metricName="accuracy"
+    ).evaluate(predictions)
+    f1 = MulticlassClassificationEvaluator(
+        labelCol=LABEL_COL, predictionCol="prediction", metricName="f1"
+    ).evaluate(predictions)
+    auc = BinaryClassificationEvaluator(
+        labelCol=LABEL_COL,
+        rawPredictionCol="prob_ensemble",
+        metricName="areaUnderROC",
+    ).evaluate(predictions)
+    return acc, f1, auc
+
 
 def main() -> None:
     """Entry point for ``spark-submit``."""
@@ -341,6 +417,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = out_dir / "stage3_model_metrics.csv"
 
+    trained_models: Dict[str, PipelineModel] = {}
     with metrics_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(["model", "accuracy", "f1", "auc"])
@@ -351,7 +428,7 @@ def main() -> None:
             ("nb", make_nb),
         ):
             pipeline, grid, classifier = builder()
-            train_one(
+            trained_models[name] = train_one(
                 name=name,
                 pipeline=pipeline,
                 grid=grid,
@@ -361,6 +438,37 @@ def main() -> None:
                 ml_base=args.ml_base,
                 out_dir=out_dir,
                 metrics_writer=writer,
+            )
+
+        # Soft-voting ensemble of the strong non-NB models.
+        print(
+            f"[stage3.train] === {ENSEMBLE_NAME.upper()} "
+            f"(soft voting of {', '.join(ENSEMBLE_MEMBERS)}) ===",
+            flush=True,
+        )
+        ensemble_pred = build_ensemble(trained_models, test, ENSEMBLE_MEMBERS)
+        acc, f1, auc = evaluate_ensemble(ensemble_pred)
+        print(
+            f"[stage3.train] {ENSEMBLE_NAME}: accuracy={acc:.4f}  "
+            f"f1={f1:.4f}  auc={auc:.4f}",
+            flush=True,
+        )
+        writer.writerow(
+            [ENSEMBLE_NAME, f"{acc:.6f}", f"{f1:.6f}", f"{auc:.6f}"]
+        )
+        confusion_pdf(ensemble_pred).to_csv(
+            out_dir / f"stage3_{ENSEMBLE_NAME}_confusion.csv", index=False
+        )
+        info_path = out_dir / f"stage3_{ENSEMBLE_NAME}_info.txt"
+        with info_path.open("w", encoding="utf-8") as fh_info:
+            fh_info.write(f"members={','.join(ENSEMBLE_MEMBERS)}\n")
+            fh_info.write(
+                "strategy=soft_voting_mean_of_positive_class_probability\n"
+            )
+            fh_info.write(f"threshold={ENSEMBLE_THRESHOLD}\n")
+            fh_info.write(
+                "note=NB excluded; its raw/probability outputs are not "
+                "well-calibrated on this dataset.\n"
             )
 
     print(f"[stage3.train] Metrics summary -> {metrics_path}", flush=True)

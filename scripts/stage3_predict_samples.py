@@ -1,22 +1,24 @@
 """Stage 3.3 — Generate sample predictions for the trained classifiers.
 
-Loads each of the best models (rf, svm, nb) saved by
+Loads each of the best models (rf, gbt, svm, nb) saved by
 ``stage3_train_models.py`` from HDFS, applies them to:
 
 * a small random sample drawn from the held-out test set, and
-* a few hand-crafted future-period scenarios (built with median lag
-  values so the inputs are realistic),
+* a few hand-crafted (country, position) scenarios built with the
+  median values of the derived numeric features from the test set,
 
-then writes a single combined CSV of predictions to ``output/``. The
-file is intentionally small so the grader can read it without HDFS.
+then writes a single combined CSV of predictions to ``output/`` that
+also includes a ``pred_ensemble`` column (soft-voted rf + gbt + svm).
+The file is intentionally small so the grader can read it without
+HDFS access.
 """
 
 import argparse
-from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable, List
 
 from pyspark.ml import PipelineModel
+from pyspark.ml.functions import vector_to_array
 from pyspark.sql import DataFrame, Row, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructType
@@ -25,8 +27,13 @@ from pyspark.sql.types import StructType
 DEFAULT_ML_BASE = "/user/team32/linkedin/ml"
 MODEL_NAMES = ("rf", "gbt", "svm", "nb")
 
-# (country, search_position) — search_city was dropped from the aggregation
-# key in stage3_prepare_dataset.py.
+# Members of the soft-voting ensemble (keep in sync with stage3_train_models.py).
+ENSEMBLE_MEMBERS = ("rf", "gbt", "svm")
+ENSEMBLE_THRESHOLD = 0.5
+
+# (country, position) pairs used to construct hand-crafted "what-if"
+# scenarios. They are not necessarily in the test set — that is the
+# whole point of having them.
 CRAFTED_SCENARIOS = (
     ("united states", "software engineer"),
     ("united kingdom", "data scientist"),
@@ -46,12 +53,6 @@ def parse_args() -> argparse.Namespace:
         default=20,
         help="Number of held-out rows to sample from the test set.",
     )
-    parser.add_argument(
-        "--future-offset-days",
-        type=int,
-        default=30,
-        help="How far in the future the crafted scenarios should land.",
-    )
     return parser.parse_args()
 
 
@@ -64,70 +65,54 @@ def build_spark() -> SparkSession:
     )
 
 
-def median_lag_values(test: DataFrame) -> Row:
-    """Return median lag/rolling values from the test set as defaults."""
+def median_feature_values(test: DataFrame) -> Row:
+    """Return median values of the derived numeric features as defaults."""
     return test.agg(
-        F.expr("percentile_approx(lag_count_1, 0.5)").alias("lag_count_1"),
-        F.expr("percentile_approx(lag_count_4, 0.5)").alias("lag_count_4"),
-        F.expr("percentile_approx(rolling_mean_count_4, 0.5)").alias(
-            "rolling_mean_count_4"
-        ),
-        F.expr("percentile_approx(lag_distinct_companies_1, 0.5)").alias(
-            "lag_distinct_companies_1"
-        ),
-        F.expr("percentile_approx(lag_distinct_skills_1, 0.5)").alias(
-            "lag_distinct_skills_1"
-        ),
+        F.expr("percentile_approx(summary_coverage, 0.5)").alias("summary_coverage"),
+        F.expr("percentile_approx(distinct_job_levels, 0.5)").alias("distinct_job_levels"),
+        F.expr("percentile_approx(distinct_job_types, 0.5)").alias("distinct_job_types"),
+        F.expr("percentile_approx(skills_per_posting, 0.5)").alias("skills_per_posting"),
+        F.expr("percentile_approx(companies_per_posting, 0.5)").alias("companies_per_posting"),
+        F.expr("percentile_approx(distinct_companies, 0.5)").alias("distinct_companies"),
+        F.expr("percentile_approx(distinct_skills, 0.5)").alias("distinct_skills"),
+        F.expr("percentile_approx(group_count, 0.5)").alias("group_count"),
     ).first()
 
 
 def build_crafted_rows(
     scenarios: Iterable[tuple],
-    future_day: date,
     defaults: Row,
     schema: StructType,
 ) -> List[tuple]:
-    """Build crafted future-period rows as tuples in ``schema`` field order.
+    """Build crafted rows as tuples in ``schema`` field order.
 
     We avoid ``pyspark.sql.Row(**kwargs)`` because PySpark sorts kwargs
     alphabetically, which would misalign the values when the row is
     later interpreted under an explicit schema.
     """
-    iso_week = future_day.isocalendar()[1]
-    iso_weekday = future_day.isoweekday()  # 1=Monday..7=Sunday
-    # Spark's ``dayofweek`` returns 1=Sunday..7=Saturday, so adjust.
-    spark_dow = (iso_weekday % 7) + 1
-    quarter = (future_day.month - 1) // 3 + 1
-    is_weekend = 1 if iso_weekday in (6, 7) else 0
-
-    lag_count_1 = int(defaults["lag_count_1"] or 0)
-    lag_count_4 = int(defaults["lag_count_4"] or 0)
-    rolling_mean_count_4 = float(defaults["rolling_mean_count_4"] or 0)
-    lag_distinct_companies_1 = int(defaults["lag_distinct_companies_1"] or 0)
-    lag_distinct_skills_1 = int(defaults["lag_distinct_skills_1"] or 0)
+    summary_coverage = float(defaults["summary_coverage"] or 0.0)
+    distinct_job_levels = int(defaults["distinct_job_levels"] or 0)
+    distinct_job_types = int(defaults["distinct_job_types"] or 0)
+    skills_per_posting = float(defaults["skills_per_posting"] or 0.0)
+    companies_per_posting = float(defaults["companies_per_posting"] or 0.0)
+    distinct_companies = int(defaults["distinct_companies"] or 0)
+    distinct_skills = int(defaults["distinct_skills"] or 0)
+    group_count = int(defaults["group_count"] or 0)
 
     field_names = [f.name for f in schema.fields]
     rows: List[tuple] = []
     for country, position in scenarios:
         values = {
-            "time_bucket": future_day,
             "search_country": country,
             "search_position": position,
-            "group_count": 0,
-            "distinct_companies": 0,
-            "distinct_skills": 0,
-            "summary_coverage": 0.0,
-            "year": future_day.year,
-            "month": future_day.month,
-            "week_of_year": iso_week,
-            "day_of_week": spark_dow,
-            "quarter": quarter,
-            "is_weekend": is_weekend,
-            "lag_count_1": lag_count_1,
-            "lag_count_4": lag_count_4,
-            "rolling_mean_count_4": rolling_mean_count_4,
-            "lag_distinct_companies_1": lag_distinct_companies_1,
-            "lag_distinct_skills_1": lag_distinct_skills_1,
+            "group_count": group_count,
+            "distinct_companies": distinct_companies,
+            "distinct_skills": distinct_skills,
+            "distinct_job_levels": distinct_job_levels,
+            "distinct_job_types": distinct_job_types,
+            "summary_coverage": summary_coverage,
+            "skills_per_posting": skills_per_posting,
+            "companies_per_posting": companies_per_posting,
             "high_demand": 0,
         }
         rows.append(tuple(values.get(name) for name in field_names))
@@ -150,14 +135,9 @@ def main() -> None:
         )
     )
 
-    future_day = date.today() + timedelta(days=args.future_offset_days)
-    defaults = median_lag_values(test)
-    crafted_rows = build_crafted_rows(
-        CRAFTED_SCENARIOS, future_day, defaults, test.schema
-    )
+    defaults = median_feature_values(test)
+    crafted_rows = build_crafted_rows(CRAFTED_SCENARIOS, defaults, test.schema)
 
-    # Build the crafted frame using the same schema as the test set so
-    # ``unionByName`` works. ``source`` is added afterwards.
     crafted = (
         spark.createDataFrame(crafted_rows, schema=test.schema).withColumn(
             "source", F.lit("crafted")
@@ -171,7 +151,6 @@ def main() -> None:
     base = combined.select(
         "row_id",
         "source",
-        "time_bucket",
         "search_country",
         "search_position",
         F.col("high_demand").alias("true_label"),
@@ -181,20 +160,62 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     merged = base
+    prob_dfs = {}
     for name in MODEL_NAMES:
         model_path = f"{args.ml_base}/models/{name}"
         print(f"[stage3.predict] Loading model: {model_path}", flush=True)
         model = PipelineModel.load(model_path)
-        preds = model.transform(combined).select(
+        preds = model.transform(combined)
+
+        pred_col = preds.select(
             "row_id", F.col("prediction").cast("int").alias(f"pred_{name}")
         )
-        merged = merged.join(preds, "row_id", "left")
+        merged = merged.join(pred_col, "row_id", "left")
+
+        # Only ensemble members need to contribute a positive-class
+        # probability column. NB is excluded for the same reason as in
+        # stage3_train_models.py (uncalibrated outputs).
+        if name in ENSEMBLE_MEMBERS:
+            if "probability" in preds.columns:
+                prob = (
+                    preds.withColumn("_pa", vector_to_array("probability"))
+                    .withColumn(f"prob_{name}", F.col("_pa")[1])
+                    .select("row_id", f"prob_{name}")
+                )
+            else:
+                prob = (
+                    preds.withColumn("_ra", vector_to_array("rawPrediction"))
+                    .withColumn(
+                        f"prob_{name}",
+                        F.expr("1.0 / (1.0 + exp(-_ra[1]))"),
+                    )
+                    .select("row_id", f"prob_{name}")
+                )
+            prob_dfs[name] = prob
+
+    # Soft-voting ensemble: average the per-model positive-class
+    # probabilities, threshold at ``ENSEMBLE_THRESHOLD``.
+    ensemble_df = combined.select("row_id")
+    for name in ENSEMBLE_MEMBERS:
+        ensemble_df = ensemble_df.join(prob_dfs[name], "row_id")
+    prob_cols = [F.col(f"prob_{n}") for n in ENSEMBLE_MEMBERS]
+    ensemble_df = ensemble_df.withColumn(
+        "pred_ensemble",
+        F.when(
+            sum(prob_cols) / float(len(ENSEMBLE_MEMBERS))
+            >= F.lit(ENSEMBLE_THRESHOLD),
+            F.lit(1),
+        )
+        .otherwise(F.lit(0))
+        .cast("int"),
+    ).select("row_id", "pred_ensemble")
+    merged = merged.join(ensemble_df, "row_id", "left")
 
     out_path = out_dir / "stage3_sample_predictions.csv"
     print(f"[stage3.predict] Writing predictions -> {out_path}", flush=True)
     (
         merged.drop("row_id")
-        .orderBy("source", "time_bucket")
+        .orderBy("source", "search_country", "search_position")
         .toPandas()
         .to_csv(out_path, index=False)
     )
